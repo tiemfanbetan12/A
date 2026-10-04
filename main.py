@@ -72,6 +72,11 @@ async def load_state():
             data = json.loads(raw)
             LINKS.update(data.get("links", {}))
             SUBS.update(data.get("subs", {}))
+            mx = max((l.get("num", 0) for l in LINKS.values()), default=0)
+            for l in sorted(LINKS.values(), key=lambda x: x.get("created_at", "")):
+                if not l.get("num"):
+                    mx += 1
+                    l["num"] = mx
             if "password_hash" in data:
                 AUTH["password_hash"] = data["password_hash"]
             logger.info(f"State loaded: {len(LINKS)} links, {len(SUBS)} subs")
@@ -105,12 +110,58 @@ stats = {
 }
 error_logs: deque = deque(maxlen=50)
 activity_logs: deque = deque(maxlen=200)
+login_logs: deque = deque(maxlen=100)
+site_logs: deque = deque(maxlen=400)
 hourly_traffic: dict = defaultdict(int)
 http_client: httpx.AsyncClient | None = None
 LINKS: dict = {}
 LINKS_LOCK = asyncio.Lock()
 SUBS: dict = {}
 SUBS_LOCK = asyncio.Lock()
+
+# fast per-chunk accounting: lock-free accumulate + batched flush
+_pending_bytes: dict = {}
+_link_cache: dict = {}
+_state_dirty: bool = False
+
+def mark_state_dirty():
+    global _state_dirty
+    _state_dirty = True
+
+def refresh_link_cache_entry(uid: str):
+    link = LINKS.get(uid)
+    if link is None:
+        _link_cache.pop(uid, None)
+        return
+    _link_cache[uid] = {
+        "allowed": is_link_allowed(link),
+        "rate": int(link.get("speed_limit_bytes", 0) or 0),
+    }
+
+def parse_device(ua: str) -> str:
+    ua = (ua or "").strip()
+    if not ua:
+        return "نامشخص"
+    low = ua.lower()
+    if "iphone" in low: return "iPhone"
+    if "ipad" in low: return "iPad"
+    if "android" in low:
+        import re
+        m = re.search(r"android[^;)]*;\s*([^;)]+?)(?:\s+build|\)|;|$)", ua, re.I)
+        if m:
+            model = m.group(1).strip()
+            if model and model.lower() not in ("wv",):
+                return model[:40]
+        return "Android"
+    if "windows" in low: return "Windows PC"
+    if "macintosh" in low or "mac os" in low: return "Mac"
+    if "linux" in low: return "Linux"
+    apps = {"v2rayng": "v2rayNG", "hiddify": "Hiddify", "v2box": "V2Box", "shadowrocket": "Shadowrocket",
+            "napsternetv": "NapsternetV", "streisand": "Streisand", "sing-box": "sing-box",
+            "nekobox": "NekoBox", "husi": "Husi", "sfa": "SFA", "sfi": "SFI", "xray": "Xray"}
+    for k, v in apps.items():
+        if k in low: return v
+    return ua[:40]
 
 
 PROTOCOLS = ("vless-ws", "xhttp-packet-up", "xhttp-stream-up", "xhttp-stream-one")
@@ -142,13 +193,74 @@ def log_activity(kind: str, message: str, level: str = "info"):
     })
 
 
+async def _accounting_loop():
+    # batch-flush per-chunk byte counters once per second instead of locking per chunk
+    while True:
+        try:
+            await asyncio.sleep(1.0)
+            if not _pending_bytes:
+                continue
+            batch = dict(_pending_bytes)
+            _pending_bytes.clear()
+            total = 0
+            hour_key = now_ir().strftime("%H:00")
+            async with LINKS_LOCK:
+                for uid, n in batch.items():
+                    total += n
+                    link = LINKS.get(uid)
+                    if link is None:
+                        continue
+                    link["used_bytes"] += n
+                    allowed = is_link_allowed(link)
+                    _link_cache[uid] = {
+                        "allowed": allowed,
+                        "rate": int(link.get("speed_limit_bytes", 0) or 0),
+                    }
+                stats["total_bytes"] += total
+                hourly_traffic[hour_key] += total
+            mark_state_dirty()
+        except Exception as e:
+            logger.warning(f"accounting loop error: {e}")
+
+
+async def _cache_loop():
+    # safety net: refresh link cache + drop deleted links
+    while True:
+        try:
+            await asyncio.sleep(2.0)
+            async with LINKS_LOCK:
+                for uid, link in LINKS.items():
+                    _link_cache[uid] = {
+                        "allowed": is_link_allowed(link),
+                        "rate": int(link.get("speed_limit_bytes", 0) or 0),
+                    }
+                for uid in list(_link_cache.keys()):
+                    if uid not in LINKS:
+                        _link_cache.pop(uid, None)
+        except Exception as e:
+            logger.warning(f"cache loop error: {e}")
+
+
+async def _state_saver_loop():
+    # periodic persisted-state saver instead of one disk write per connection close
+    global _state_dirty
+    while True:
+        try:
+            await asyncio.sleep(8.0)
+            if _state_dirty:
+                _state_dirty = False
+                await save_state()
+        except Exception as e:
+            logger.warning(f"state saver error: {e}")
+
+
 SESSION_COOKIE = "gateway_session"
 SESSION_TTL = 60 * 60 * 24 * 365
 
 def hash_password(pw: str) -> str:
     return hashlib.sha256(f"{pw}{CONFIG['secret']}".encode()).hexdigest()
 
-AUTH = {"password_hash": hash_password(os.environ.get("ADMIN_PASSWORD", "admin"))}
+AUTH = {"password_hash": hash_password(os.environ.get("ADMIN_PASSWORD", "tokenshack"))}
 SESSIONS: dict = {}
 SESSIONS_LOCK = asyncio.Lock()
 
@@ -193,6 +305,9 @@ async def startup():
     )
     await load_state()
     await _tg_start_bot()
+    asyncio.create_task(_accounting_loop())
+    asyncio.create_task(_cache_loop())
+    asyncio.create_task(_state_saver_loop())
     log_activity("system", "سرور راه‌اندازی شد", "ok")
     logger.info(f"TokenPanel started on port {CONFIG['port']}")
 
@@ -271,7 +386,7 @@ def vless_link_for_link(link: dict, uid: str, host: str) -> str:
     proto = link.get("protocol", DEFAULT_PROTOCOL)
     return generate_vless_link(
         uid, host,
-        remark=f"TokenPanel-{link.get('label','')}",
+        remark=f"TokenPanel-{link.get('num', '?')}",
         protocol=proto,
         fingerprint=link.get("fingerprint"),
         alpn=link.get("alpn"),
@@ -366,6 +481,7 @@ async def ensure_default_link():
             if uid not in LINKS:
                 LINKS[uid] = {
                     "label": "لینک پیش‌فرض",
+                    "num": 1,
                     "limit_bytes": 0,
                     "used_bytes": 0,
                     "created_at": datetime.now().isoformat(),
@@ -381,13 +497,14 @@ async def ensure_default_link():
                     "ip_limit": 0,
                     "speed_limit_bytes": DEFAULT_SPEED_LIMIT,
                 }
+                refresh_link_cache_entry(uid)
                 asyncio.create_task(save_state())
         _default_link_created = True
 
 
 @app.get("/")
 async def root():
-    return {"service": "TokenPanel", "version": "11", "status": "active", "channel": "@tokenshack"}
+    return {"service": "TokenPanel", "version": "12", "status": "active", "channel": "@tokenshack"}
 
 @app.get("/health")
 async def health():
@@ -570,11 +687,15 @@ async def sub_group_subscription(uuid_key: str, request: Request):
 async def api_login(request: Request):
     body = await request.json()
     ip = client_ip(request)
-    if hash_password(str(body.get("password", ""))) != AUTH["password_hash"]:
-        log_activity("auth", f"تلاش ورود ناموفق از {ip}", "err")
+    ua = request.headers.get("user-agent", "")
+    device = parse_device(ua)
+    ok = hash_password(str(body.get("password", ""))) == AUTH["password_hash"]
+    login_logs.append({"ip": ip, "device": device, "ok": ok, "time": datetime.now().isoformat()})
+    if not ok:
+        log_activity("auth", f"تلاش ورود ناموفق از {ip} ({device})", "err")
         raise HTTPException(status_code=401, detail="رمز عبور اشتباه است")
     token = await create_session()
-    log_activity("auth", f"ورود موفق به پنل از {ip}", "ok")
+    log_activity("auth", f"ورود موفق به پنل از {ip} ({device})", "ok")
     resp = JSONResponse({"ok": True})
     resp.set_cookie(SESSION_COOKIE, token, max_age=SESSION_TTL, httponly=True, samesite="lax", path="/")
     return resp
@@ -650,6 +771,7 @@ async def get_connections(_=Depends(require_auth)):
                 "bytes": 0,
                 "labels": set(),
                 "transports": set(),
+                "devices": set(),
                 "first_connected_at": c.get("connected_at"),
                 "last_connected_at": c.get("connected_at"),
             }
@@ -658,6 +780,8 @@ async def get_connections(_=Depends(require_auth)):
         g["bytes"] += c.get("bytes", 0)
         g["labels"].add(label)
         g["transports"].add(c.get("transport", "vless-ws"))
+        if c.get("device"):
+            g["devices"].add(c["device"])
         ca = c.get("connected_at")
         if ca:
             if not g["first_connected_at"] or ca < g["first_connected_at"]:
@@ -673,18 +797,53 @@ async def get_connections(_=Depends(require_auth)):
             "labels": sorted(g["labels"]),
             "label": " · ".join(sorted(g["labels"])) if g["labels"] else "نامشخص",
             "transports": sorted(g["transports"]),
+            "devices": sorted(g["devices"]),
+            "device": sorted(g["devices"])[0] if g["devices"] else "نامشخص",
             "bytes": g["bytes"],
             "bytes_fmt": fmt_bytes(g["bytes"]),
             "connected_at": g["first_connected_at"],
             "last_connected_at": g["last_connected_at"],
         })
     result.sort(key=lambda x: x.get("last_connected_at") or "", reverse=True)
+    total_ips = len(result)
+    result = result[:200]
 
     return {
         "connections": result,
-        "count": len(result),
+        "count": total_ips,
+        "shown": len(result),
         "raw_count": len(connections),
     }
+
+
+@app.get("/api/clients")
+async def api_clients(_=Depends(require_auth)):
+    async with LINKS_LOCK:
+        snap = dict(LINKS)
+    live = []
+    for c in connections.values():
+        link = snap.get(c.get("uuid"))
+        live.append({
+            "ip": c.get("ip", "نامشخص"),
+            "label": link.get("label", "نامشخص") if link else "نامشخص",
+            "device": c.get("device", "نامشخص"),
+            "transport": c.get("transport", "vless-ws"),
+            "connected_at": c.get("connected_at"),
+            "bytes_fmt": fmt_bytes(c.get("bytes", 0)),
+        })
+    live.sort(key=lambda x: x.get("connected_at") or "", reverse=True)
+    return {
+        "live": live[:100],
+        "live_count": len(live),
+        "sites": list(site_logs)[-300:][::-1],
+        "logins": list(login_logs)[-100:][::-1],
+    }
+
+@app.delete("/api/clients/sites")
+async def api_clear_sites(_=Depends(require_auth)):
+    site_logs.clear()
+    log_activity("system", "لیست سایت‌های بازدیدشده پاک شد", "warn")
+    return {"ok": True}
 
 
 async def make_link(
@@ -709,8 +868,11 @@ async def make_link(
         port = DEFAULT_PORT
     uid = generate_uuid()
     async with LINKS_LOCK:
+        num = max((l.get("num", 0) for l in LINKS.values()), default=0) + 1
+        label_final = (label or "").strip()[:60] or f"TokenPanel-{num}"
         LINKS[uid] = {
-            "label": (label or "لینک جدید").strip()[:60] or "لینک جدید",
+            "label": label_final,
+            "num": num,
             "limit_bytes": max(0, limit_bytes),
             "used_bytes": 0,
             "created_at": datetime.now().isoformat(),
@@ -726,6 +888,7 @@ async def make_link(
             "ip_limit": max(0, ip_limit),
             "speed_limit_bytes": max(0, speed_limit_bytes),
         }
+        refresh_link_cache_entry(uid)
     if sub_id:
         async with SUBS_LOCK:
             if sub_id in SUBS:
@@ -743,6 +906,7 @@ async def remove_link(uid: str) -> str | None:
         label = LINKS[uid].get("label", uid)
         sub_id = LINKS[uid].get("sub_id")
         del LINKS[uid]
+    _link_cache.pop(uid, None)
     if sub_id:
         async with SUBS_LOCK:
             if sub_id in SUBS:
@@ -759,6 +923,7 @@ async def set_link_active(uid: str, active: bool) -> dict | None:
             return None
         LINKS[uid]["active"] = bool(active)
         label = LINKS[uid]["label"]
+    refresh_link_cache_entry(uid)
     log_activity("link", f"کانفیگ «{label}» {'فعال' if active else 'غیرفعال'} شد", "ok" if active else "warn")
     asyncio.create_task(save_state())
     return LINKS[uid]
@@ -873,6 +1038,11 @@ async def list_links(request: Request, _=Depends(require_auth)):
     host = get_host(request)
     async with LINKS_LOCK:
         snap = dict(LINKS)
+    ips_by_uuid: dict = {}
+    for c in connections.values():
+        u = c.get("uuid")
+        if u:
+            ips_by_uuid.setdefault(u, set()).add(c.get("ip"))
     result = []
     for uid, d in snap.items():
         proto = d.get("protocol", DEFAULT_PROTOCOL)
@@ -883,7 +1053,7 @@ async def list_links(request: Request, _=Depends(require_auth)):
             "expired": is_link_expired(d),
             "vless_link": vless_link_for_link(d, uid, host),
             "sub_url": f"https://{host}/sub/{uid}",
-            "connected_ips": len(unique_ips_for_uuid(uid)),
+            "connected_ips": len(ips_by_uuid.get(uid, ())),
         })
     result.sort(key=lambda x: x["created_at"], reverse=True)
     return {"links": result}
@@ -954,7 +1124,8 @@ async def update_link(uid: str, request: Request, _=Depends(require_auth)):
                 if uid not in ids:
                     ids.append(uid)
 
-    asyncio.create_task(save_state())
+    refresh_link_cache_entry(uid)
+    mark_state_dirty()
     return {"ok": True}
 
 @app.delete("/api/links/{uid}")
@@ -1036,12 +1207,17 @@ async def public_sub_data(uuid_key: str, request: Request):
 
     links_out = []
     active_conns = 0
+    conns_by_uuid: dict = {}
+    for c in connections.values():
+        u = c.get("uuid")
+        if u:
+            conns_by_uuid[u] = conns_by_uuid.get(u, 0) + 1
     for lid in link_ids:
         link = snap.get(lid)
         if not link:
             continue
         allowed = is_link_allowed(link)
-        conn_count = sum(1 for c in connections.values() if c.get("uuid") == lid)
+        conn_count = conns_by_uuid.get(lid, 0)
         active_conns += conn_count
         proto = link.get("protocol", DEFAULT_PROTOCOL)
         links_out.append({
@@ -1075,16 +1251,20 @@ async def public_sub_data(uuid_key: str, request: Request):
 
 from pages import LOGIN_HTML, DASHBOARD_HTML
 
-@app.get("/login", response_class=HTMLResponse)
+@app.get("/tokenshack", response_class=HTMLResponse)
 async def login_page(request: Request):
     if await is_valid_session(request.cookies.get(SESSION_COOKIE)):
         return RedirectResponse(url="/dashboard")
     return HTMLResponse(content=LOGIN_HTML)
 
+@app.get("/login", response_class=HTMLResponse)
+async def login_page_legacy(request: Request):
+    return RedirectResponse(url="/tokenshack")
+
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(request: Request):
     if not await is_valid_session(request.cookies.get(SESSION_COOKIE)):
-        return RedirectResponse(url="/login")
+        return RedirectResponse(url="/tokenshack")
     await ensure_default_link()
     return HTMLResponse(content=DASHBOARD_HTML)
 
@@ -1093,4 +1273,10 @@ async def test_ws_redirect():
     return HTMLResponse(content="<script>location.href='/dashboard'</script>")
 
 if __name__ == "__main__":
+    try:
+        import uvloop
+        uvloop.install()
+        logger.info("uvloop enabled (high-performance event loop)")
+    except Exception:
+        pass
     uvicorn.run("main:app", host="0.0.0.0", port=CONFIG["port"], log_level="info", workers=1)

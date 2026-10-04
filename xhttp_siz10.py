@@ -17,7 +17,9 @@ from main import (
     logger,
     is_link_allowed,
     is_ip_allowed,
-    save_state,
+    mark_state_dirty,
+    parse_device,
+    site_logs,
 )
 from relay_vless import parse_vless_header, check_and_use
 from speed_limit import throttle
@@ -108,14 +110,14 @@ class _QuotaGate:
                 target = int(self.rate_ewma * QUOTA_CHECK_INTERVAL)
                 self.batch_bytes = max(QUOTA_MIN_BATCH, min(QUOTA_MAX_BATCH, target or QUOTA_MIN_BATCH))
             self.last_check = now
-            self.ok = await check_and_use(self.uuid, flush)
+            self.ok = check_and_use(self.uuid, flush)
             return self.ok
         return True
 
     async def flush(self) -> bool:
         if self.pending:
             flush, self.pending = self.pending, 0
-            self.ok = self.ok and await check_and_use(self.uuid, flush)
+            self.ok = self.ok and check_and_use(self.uuid, flush)
         return self.ok
 
 
@@ -169,7 +171,7 @@ async def _check_link(uuid: str):
         raise HTTPException(status_code=403, detail="not authorized")
 
 
-async def _get_or_create_session(uuid: str, mode: str, session_id: str, ip: str = "نامشخص") -> dict:
+async def _get_or_create_session(uuid: str, mode: str, session_id: str, ip: str = "نامشخص", ua: str = "") -> dict:
     async with XHTTP_LOCK:
         sess = xhttp_sessions.get(session_id)
         if sess is not None:
@@ -189,6 +191,8 @@ async def _get_or_create_session(uuid: str, mode: str, session_id: str, ip: str 
             "connected_at": datetime.now().isoformat(),
             "bytes": 0,
             "transport": f"xhttp-{mode}",
+            "ua": (ua or "")[:180],
+            "device": parse_device(ua),
         }
         sess = {
             "uuid": uuid, "mode": mode, "writer": None,
@@ -287,12 +291,22 @@ async def _pump_tcp_to_queue(session_id: str, uuid: str, reader: asyncio.StreamR
 async def _open_tcp_for_session(session_id: str, uuid: str, sess: dict, first_chunk: bytes):
     reader, writer, address, port = await _open_tcp_from_header(first_chunk)
     logger.info(f"connect XHTTP[{sess['mode']}] [{session_id[:8]}] -> {address}:{port}")
+    conn = connections.get(sess["conn_id"]) or {}
+    link = LINKS.get(uuid)
+    site_logs.append({
+        "address": address,
+        "port": port,
+        "ip": conn.get("ip", "نامشخص"),
+        "label": link.get("label", "?") if link else "?",
+        "device": conn.get("device", "نامشخص"),
+        "time": datetime.now().isoformat(),
+    })
     sess["writer"] = writer
     sess["tcp_open"] = True
     sess["downlink_task"] = asyncio.create_task(
         _pump_tcp_to_queue(session_id, uuid, reader, sess["down_q"])
     )
-    asyncio.create_task(save_state())
+    mark_state_dirty()
 
 
 def _downstream_gen(sess: dict):
@@ -316,7 +330,7 @@ async def xhttp_downlink(mode: str, uuid: str, session_id: str, request: Request
         raise HTTPException(status_code=404, detail="unknown mode")
     await _check_link(uuid)
     fp = request.query_params.get("fp", DEFAULT_FINGERPRINT)
-    sess = await _get_or_create_session(uuid, mode, session_id, _req_client_ip(request))
+    sess = await _get_or_create_session(uuid, mode, session_id, _req_client_ip(request), request.headers.get("user-agent", ""))
     if sess.get("closed"):
         raise HTTPException(status_code=404, detail="session closed")
 
@@ -327,7 +341,7 @@ async def xhttp_downlink(mode: str, uuid: str, session_id: str, request: Request
 @router.post("/xhttp-siz10/packet-up/{uuid}/{session_id}/{seq}")
 async def packet_up_upload(uuid: str, session_id: str, seq: int, request: Request):
     ensure_reaper()
-    sess = await _get_or_create_session(uuid, "packet-up", session_id, _req_client_ip(request))
+    sess = await _get_or_create_session(uuid, "packet-up", session_id, _req_client_ip(request), request.headers.get("user-agent", ""))
     if sess.get("closed"):
         raise HTTPException(status_code=404, detail="session closed")
 
@@ -336,7 +350,7 @@ async def packet_up_upload(uuid: str, session_id: str, seq: int, request: Reques
     if not body:
         return {"ok": True}
 
-    if not await check_and_use(uuid, len(body)):
+    if not check_and_use(uuid, len(body)):
         await _teardown(session_id)
         raise HTTPException(status_code=403, detail="quota/disabled/unknown")
     await throttle(uuid, len(body))
@@ -384,7 +398,7 @@ async def packet_up_upload(uuid: str, session_id: str, seq: int, request: Reques
 @router.post("/xhttp-siz10/stream-up/{uuid}/{session_id}")
 async def stream_up_upload(uuid: str, session_id: str, request: Request):
     ensure_reaper()
-    sess = await _get_or_create_session(uuid, "stream-up", session_id, _req_client_ip(request))
+    sess = await _get_or_create_session(uuid, "stream-up", session_id, _req_client_ip(request), request.headers.get("user-agent", ""))
     if sess.get("closed"):
         raise HTTPException(status_code=404, detail="session closed")
 

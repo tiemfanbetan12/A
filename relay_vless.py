@@ -8,20 +8,22 @@ from main import (
     LINKS,
     LINKS_LOCK,
     stats,
-    hourly_traffic,
     connections,
     error_logs,
     logger,
     is_link_allowed,
     is_ip_allowed,
-    save_state,
+    mark_state_dirty,
     log_activity,
-    now_ir,
+    parse_device,
+    site_logs,
+    _link_cache,
+    _pending_bytes,
 )
 from speed_limit import throttle
 
 
-RELAY_BUF = 256 * 1024
+RELAY_BUF = 512 * 1024
 
 def _ws_client_ip(ws: WebSocket) -> str:
     fwd = ws.headers.get("x-forwarded-for")
@@ -53,16 +55,12 @@ async def parse_vless_header(chunk: bytes):
         raise ValueError(f"unknown addr type: {addr_type}")
     return command, address, port, chunk[pos:]
 
-async def check_and_use(uid: str, n: int) -> bool:
-    async with LINKS_LOCK:
-        link = LINKS.get(uid)
-        if link is None:
-            return False
-        if not is_link_allowed(link):
-            return False
-        link["used_bytes"] += n
-        stats["total_bytes"] += n
-        hourly_traffic[now_ir().strftime("%H:00")] += n
+def check_and_use(uid: str, n: int) -> bool:
+    # lock-free hot path: cached state + deferred batched accounting
+    st = _link_cache.get(uid)
+    if st is None or not st["allowed"]:
+        return False
+    _pending_bytes[uid] = _pending_bytes.get(uid, 0) + n
     return True
 
 async def relay_ws_to_tcp(ws: WebSocket, writer: asyncio.StreamWriter, conn_id: str, uid: str):
@@ -74,7 +72,7 @@ async def relay_ws_to_tcp(ws: WebSocket, writer: asyncio.StreamWriter, conn_id: 
             data = msg.get("bytes") or (msg.get("text") or "").encode()
             if not data:
                 continue
-            if not await check_and_use(uid, len(data)):
+            if not check_and_use(uid, len(data)):
                 await ws.close(code=1008, reason="quota/disabled/unknown")
                 break
             await throttle(uid, len(data))
@@ -98,7 +96,7 @@ async def relay_tcp_to_ws(ws: WebSocket, reader: asyncio.StreamReader, conn_id: 
             data = await reader.read(RELAY_BUF)
             if not data:
                 break
-            if not await check_and_use(uid, len(data)):
+            if not check_and_use(uid, len(data)):
                 await ws.close(code=1008, reason="quota/disabled/unknown")
                 break
             await throttle(uid, len(data))
@@ -129,12 +127,15 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
         return
 
     conn_id = secrets.token_urlsafe(6)
+    ua = ws.headers.get("user-agent", "")
     connections[conn_id] = {
         "uuid": uuid,
         "ip": ip,
         "transport": "vless-ws",
         "connected_at": datetime.now().isoformat(),
         "bytes": 0,
+        "ua": ua[:180],
+        "device": parse_device(ua),
     }
     logger.info(f"✅ WS [{conn_id}] uuid={uuid[:8]}… ip={ip} total={len(connections)}")
     log_activity("connection", f"اتصال جدید از {ip} (کانفیگ {link.get('label','?')})", "info")
@@ -150,9 +151,18 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
 
         command, address, port, payload = await parse_vless_header(first_chunk)
 
-        if not await check_and_use(uuid, len(first_chunk)):
+        if not check_and_use(uuid, len(first_chunk)):
             await ws.close(code=1008, reason="quota/disabled")
             return
+
+        site_logs.append({
+            "address": address,
+            "port": port,
+            "ip": ip,
+            "label": link.get("label", "?") if link else "?",
+            "device": connections[conn_id].get("device", "نامشخص"),
+            "time": datetime.now().isoformat(),
+        })
 
         stats["total_requests"] += 1
         connections[conn_id]["bytes"] += len(first_chunk)
@@ -185,7 +195,7 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
             except asyncio.CancelledError:
                 pass
 
-        asyncio.create_task(save_state())
+        mark_state_dirty()
 
     except WebSocketDisconnect:
         pass

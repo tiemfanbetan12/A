@@ -1,7 +1,7 @@
 import asyncio
 import time
 
-from main import LINKS
+from main import _link_cache
 
 
 _buckets: dict = {}
@@ -50,8 +50,8 @@ def _get_bucket(uuid: str, rate: int) -> _Bucket:
 async def throttle(uuid: str, nbytes: int):
     if nbytes <= 0:
         return
-    link = LINKS.get(uuid)
-    rate = int((link or {}).get("speed_limit_bytes", 0) or 0)
+    st = _link_cache.get(uuid)
+    rate = int((st or {}).get("rate", 0) or 0)
     if rate <= 0:
         return
     bucket = _get_bucket(uuid, rate)
